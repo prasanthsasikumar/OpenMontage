@@ -23,6 +23,11 @@ htmlcov/
 # Pipeline outputs (regenerable — never commit large media)
 output/
 pipeline/
+# Per-run checkpoints + decision logs written by the checkpoint protocol to
+# pipelines/<project_id>/ (see AGENT_GUIDE "Human Checkpoint Protocol"). These
+# are regenerable run state, not source — the singular pipeline/ rule above
+# does not match this plural path.
+pipelines/
 tests/qa/output/
 
 # Project workspaces (generated assets, renders — all regenerable)
