@@ -714,6 +714,165 @@ class VideoCompose(BaseTool):
             )
         return comp
 
+    @classmethod
+    def _edit_decisions_to_cinematic_props(
+        cls,
+        edit_decisions: dict[str, Any],
+        resolved_cuts: list[dict[str, Any]],
+        asset_manifest: Optional[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Adapt the canonical edit_decisions schema (cuts/overlays/audio) into
+        the CinematicRenderer component's actual prop contract (scenes/soundtrack/music).
+
+        CinematicRenderer.tsx (remotion-composer/src/CinematicRenderer.tsx) expects
+        `scenes: CinematicScene[]` placed on an absolute timeline via startSeconds/
+        durationSeconds, plus `music`/`soundtrack` as `{src, volume, ...}`. The
+        canonical edit_decisions schema instead expresses a sequential `cuts[]`
+        list (in_seconds/out_seconds are trim points within each source clip, not
+        timeline position) and `audio.music.asset_id`. Without this adapter,
+        CinematicRenderer receives an empty `scenes` array and its
+        calculateMetadata falls back to a hardcoded 30-second duration with no
+        audio — a silent truncation, not a render failure.
+        """
+        scenes: list[dict[str, Any]] = []
+        t = 0.0
+        # Multiple portrait clips shown side by side for the same time slot —
+        # see AGENT_GUIDE-adjacent scene_plan convention: a grid cut's `source`
+        # points at only the first cell; the rest live here keyed by scene id
+        # (cut id with the "cut-" prefix stripped).
+        grid_scenes_map = (edit_decisions.get("metadata") or {}).get("grid_scenes", {})
+
+        for cut in resolved_cuts:
+            in_s = cut.get("in_seconds", 0) or 0
+            out_s = cut.get("out_seconds", in_s) or in_s
+            dur = max(0.01, out_s - in_s)
+            scene_id = cut.get("id", f"cut-{len(scenes)}")
+            grid_key = scene_id[4:] if scene_id.startswith("cut-") else scene_id
+            grid_cell_paths = grid_scenes_map.get(grid_key)
+
+            if grid_cell_paths:
+                scene = {
+                    "id": scene_id,
+                    "kind": "grid",
+                    "startSeconds": round(t, 3),
+                    "durationSeconds": round(dur, 3),
+                    "cells": [
+                        {"src": cell_path, "trimBeforeSeconds": 0, "trimAfterSeconds": dur}
+                        for cell_path in grid_cell_paths
+                    ],
+                }
+            else:
+                scene = {
+                    "id": scene_id,
+                    "kind": "video",
+                    "startSeconds": round(t, 3),
+                    "durationSeconds": round(dur, 3),
+                    "src": cut["source"],
+                }
+                if in_s:
+                    scene["trimBeforeSeconds"] = in_s
+                if out_s:
+                    scene["trimAfterSeconds"] = out_s
+                # CinematicRenderer defaults fit to "contain" (no cropping,
+                # any orientation) unless a caller explicitly overrides it.
+
+            transition_duration = cut.get("transition_duration") or 0
+            if transition_duration:
+                frames = round(transition_duration * 30)
+                scene["fadeInFrames"] = frames
+                scene["fadeOutFrames"] = frames
+            scenes.append(scene)
+            t += dur
+
+        # Title-card overlays -> CinematicTitleScene, appended after video scenes
+        # so they paint on top (CinematicRenderer stacks scenes in array order,
+        # not by timeline position — overlapping Sequences are independent).
+        title_windows = (edit_decisions.get("metadata") or {}).get("title_card_windows", [])
+        text_by_id = {w["asset_id"]: w.get("text", "") for w in title_windows}
+        for ov in edit_decisions.get("overlays", []):
+            asset_id = ov.get("asset_id")
+            text = text_by_id.get(asset_id)
+            if not text:
+                continue
+            start = ov.get("start_seconds", 0)
+            end = ov.get("end_seconds", start)
+            scenes.append({
+                "id": asset_id,
+                "kind": "title",
+                "startSeconds": round(start, 3),
+                "durationSeconds": round(max(0.01, end - start), 3),
+                "text": text,
+                "variant": "overlay",
+            })
+
+        props: dict[str, Any] = {"scenes": scenes}
+
+        music_cfg = (edit_decisions.get("audio") or {}).get("music")
+        if music_cfg and asset_manifest:
+            asset_lookup = {a["id"]: a for a in asset_manifest.get("assets", [])}
+            asset = asset_lookup.get(music_cfg.get("asset_id"))
+            if asset:
+                props["music"] = {
+                    "src": str(Path(asset["path"]).resolve()),
+                    "volume": music_cfg.get("volume", 0.5),
+                    "fadeInSeconds": music_cfg.get("fade_in_seconds", 2),
+                    "fadeOutSeconds": music_cfg.get("fade_out_seconds", 3),
+                }
+
+        if "renderer_family" in edit_decisions:
+            props["renderer_family"] = edit_decisions["renderer_family"]
+        if "playbook" in edit_decisions:
+            props["playbook"] = edit_decisions["playbook"]
+        if "metadata" in edit_decisions:
+            props["metadata"] = edit_decisions["metadata"]
+
+        return props
+
+    @staticmethod
+    def _stage_remotion_public_dir(
+        output_path: Path, file_paths: list[str]
+    ) -> tuple[Path, dict[str, str]]:
+        """Copy external local assets into a per-render public dir.
+
+        Remotion's asset downloader (@remotion/renderer/dist/assets/read-file.js)
+        only accepts http:// and https:// URLs — file:// URIs are rejected
+        outright, and bare absolute paths get concatenated onto the webpack
+        bundle root by the dev server (producing a nonsensical path) rather
+        than read from disk. Neither works for referencing a user's source
+        footage that lives outside remotion-composer/public/. The reliable
+        mechanism is `staticFile()` + `npx remotion render --public-dir=<dir>`.
+
+        `--public-dir` is copied wholesale into the webpack bundle's own
+        `public/` folder at bundle time (@remotion/bundler/dist/bundle.js
+        `copyDir`). Symlinks are only "forwarded" (recreated as symlinks in
+        the bundle) with a console warning, and this render setup does not
+        reliably resolve them from there — so we do a real copy instead of
+        a symlink. Slower and uses more disk, but matches the code path
+        Remotion actually exercises everywhere else (real files in public/).
+        """
+        import shutil as _shutil
+
+        public_dir = output_path.parent / ".remotion_public"
+        public_dir.mkdir(parents=True, exist_ok=True)
+        basename_map: dict[str, str] = {}
+        used: dict[str, str] = {}
+        for fp in file_paths:
+            if fp in basename_map:
+                continue
+            src = Path(fp)
+            name = src.name
+            candidate = name
+            i = 1
+            while candidate in used and used[candidate] != fp:
+                candidate = f"{src.stem}_{i}{src.suffix}"
+                i += 1
+            used[candidate] = fp
+            basename_map[fp] = candidate
+            dest_path = public_dir / candidate
+            if not dest_path.exists() or dest_path.stat().st_size != src.stat().st_size:
+                _shutil.copy2(src.resolve(), dest_path)
+        return public_dir, basename_map
+
     def _render_via_atelier(
         self,
         inputs: dict[str, Any],
@@ -1407,10 +1566,54 @@ class VideoCompose(BaseTool):
             )
         # --- Explicit Remotion path (render_runtime == 'remotion') ---
         if self._needs_remotion(resolved_cuts):
+            renderer_family = edit_decisions.get("renderer_family", "")
+            composition_id = None
+            try:
+                composition_id = self._get_composition_id(renderer_family)
+            except ValueError:
+                pass
+
             remotion_inputs: dict[str, Any] = {
-                "edit_decisions": dict(edit_decisions, cuts=resolved_cuts),
                 "output_path": str(output_path),
             }
+
+            if composition_id == "CinematicRenderer":
+                # CinematicRenderer.tsx does not consume the canonical
+                # cuts/overlays/audio shape directly — adapt it to the
+                # component's actual scenes/music prop contract. See
+                # _edit_decisions_to_cinematic_props docstring.
+                composition_data = self._edit_decisions_to_cinematic_props(
+                    edit_decisions, resolved_cuts, asset_manifest
+                )
+                # Stage local source files into a public dir Remotion can
+                # actually serve them from. See _stage_remotion_public_dir.
+                file_paths = [
+                    s["src"] for s in composition_data.get("scenes", [])
+                    if s.get("kind") == "video" and s.get("src")
+                ]
+                for s in composition_data.get("scenes", []):
+                    if s.get("kind") == "grid":
+                        file_paths.extend(c["src"] for c in s.get("cells", []) if c.get("src"))
+                music_src = (composition_data.get("music") or {}).get("src")
+                if music_src:
+                    file_paths.append(music_src)
+                # Must be absolute: npx remotion runs with cwd=composer_dir,
+                # so a relative --public-dir would resolve against the wrong root.
+                public_dir, basename_map = self._stage_remotion_public_dir(output_path.resolve(), file_paths)
+                for scene in composition_data.get("scenes", []):
+                    if scene.get("kind") == "video" and scene.get("src") in basename_map:
+                        scene["src"] = basename_map[scene["src"]]
+                    elif scene.get("kind") == "grid":
+                        for cell in scene.get("cells", []):
+                            if cell.get("src") in basename_map:
+                                cell["src"] = basename_map[cell["src"]]
+                if music_src in basename_map:
+                    composition_data["music"]["src"] = basename_map[music_src]
+                remotion_inputs["public_dir"] = str(public_dir)
+            else:
+                composition_data = dict(edit_decisions, cuts=resolved_cuts)
+
+            remotion_inputs["edit_decisions"] = composition_data
             if profile:
                 remotion_inputs["profile"] = profile
             # Forward the creator-facing render timeout through the high-level
@@ -1754,6 +1957,13 @@ class VideoCompose(BaseTool):
             f"--props={props_path}",
         ]
 
+        # Custom public dir — used to serve locally-staged source assets
+        # that live outside remotion-composer/public/. See
+        # _stage_remotion_public_dir.
+        public_dir = inputs.get("public_dir")
+        if public_dir:
+            cmd.append(f"--public-dir={public_dir}")
+
         # Apply media profile dimensions
         profile_name = inputs.get("profile")
         if profile_name:
@@ -1769,8 +1979,13 @@ class VideoCompose(BaseTool):
         # restricted networks the default 30s browser setup times out with an
         # opaque failure. Pass it through and give the subprocess enough headroom
         # so run_command() does not kill Remotion before its own timeout fires.
+        # Scale the baseline subprocess timeout with scene count — a flat 600s
+        # starves large source-led cuts (e.g. 90+ scenes, grid scenes with
+        # multiple simultaneous decodes) well before they'd naturally finish.
+        # An explicit remotion_timeout_ms below can still raise it further.
+        n_scenes = len(composition_data.get("scenes", [])) if isinstance(composition_data, dict) else 0
         remotion_timeout_ms = inputs.get("remotion_timeout_ms")
-        subprocess_timeout = 600
+        subprocess_timeout = max(600, n_scenes * 15)
         if remotion_timeout_ms:
             try:
                 ms = int(remotion_timeout_ms)

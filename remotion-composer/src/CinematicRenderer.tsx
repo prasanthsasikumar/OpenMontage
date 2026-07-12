@@ -19,11 +19,23 @@ function resolveAsset(src: string): string {
   }
   const clean = src.replace(/^file:\/\/\/?/, "");
   if (clean.startsWith("/") || /^[A-Za-z]:[/\\]/.test(clean)) {
-    const posix = clean.replace(/\\/g, "/");
     // POSIX absolute paths already have a leading "/" — file:// + posix
     // gives exactly three slashes. Windows drive paths (C:/...) need the
     // extra slash added explicitly. Do not merge these branches — adding
     // "file:///" unconditionally double-slashes POSIX paths (file:////...).
+    //
+    // NOTE: Remotion's asset downloader (@remotion/renderer/dist/assets/
+    // read-file.js) only accepts http:// and https:// URLs — neither a
+    // file:// URI nor a bare absolute path resolves an external local file
+    // during `remotion render` (the dev server treats a bare path as
+    // relative to its own webpack bundle root). This branch is kept for
+    // callers running in environments where that's not the case (e.g. the
+    // Remotion Studio preview server, which does resolve file:// srcs), but
+    // for actual renders, source files living outside remotion-composer/
+    // public/ must be staged into a --public-dir and referenced by
+    // basename so they hit the staticFile() branch below instead — see
+    // VideoCompose._stage_remotion_public_dir in tools/video/video_compose.py.
+    const posix = clean.replace(/\\/g, "/");
     if (posix.startsWith("/")) {
       return `file://${posix}`;
     }
@@ -31,7 +43,7 @@ function resolveAsset(src: string): string {
   }
   return staticFile(clean);
 }
-import { CinematicRendererProps, CinematicTone, CinematicVideoScene } from "./cinematic/types";
+import { CinematicRendererProps, CinematicTone, CinematicVideoScene, CinematicGridScene } from "./cinematic/types";
 import { CaptionOverlay } from "./components/CaptionOverlay";
 
 const FPS = 30;
@@ -56,32 +68,10 @@ const toneGradient = (tone: CinematicTone) => {
 };
 
 const SceneVideo: React.FC<{ scene: CinematicVideoScene }> = ({ scene }) => {
-  const frame = useCurrentFrame();
-  const { durationInFrames, fps } = useVideoConfig();
-  const fadeInFrames = scene.fadeInFrames ?? 10;
-  const fadeOutFrames = scene.fadeOutFrames ?? 10;
-  const fadeOutStart = Math.max(fadeInFrames, durationInFrames - fadeOutFrames);
-  const fadeInOpacity =
-    fadeInFrames === 0
-      ? 1
-      : interpolate(frame, [0, fadeInFrames], [0, 1], {
-          extrapolateLeft: "clamp",
-          extrapolateRight: "clamp",
-        });
-  const fadeOutOpacity =
-    fadeOutFrames === 0
-      ? 1
-      : interpolate(frame, [fadeOutStart, durationInFrames], [1, 0], {
-          extrapolateLeft: "clamp",
-          extrapolateRight: "clamp",
-        });
-  const opacity = Math.min(fadeInOpacity, fadeOutOpacity);
-
-  const scale = interpolate(frame, [0, durationInFrames], [1.015, 1], {
-    extrapolateLeft: "clamp",
-    extrapolateRight: "clamp",
-  });
-
+  const fps = useVideoConfig().fps;
+  // No fades, no color grade, no vignette, no zoom — a straight cut of the
+  // source clip, per explicit request. `scene.fadeInFrames`/`fadeOutFrames`/
+  // `filter`/`tone` are honored only if a caller explicitly sets them.
   const trimBefore =
     scene.trimBeforeSeconds !== undefined
       ? Math.round(scene.trimBeforeSeconds * fps)
@@ -92,7 +82,7 @@ const SceneVideo: React.FC<{ scene: CinematicVideoScene }> = ({ scene }) => {
       : undefined;
 
   return (
-    <AbsoluteFill style={{ backgroundColor: "#020407", opacity }}>
+    <AbsoluteFill style={{ backgroundColor: "#000000" }}>
       <OffthreadVideo
         muted
         src={resolveAsset(scene.src)}
@@ -101,31 +91,58 @@ const SceneVideo: React.FC<{ scene: CinematicVideoScene }> = ({ scene }) => {
         style={{
           width: "100%",
           height: "100%",
-          objectFit: "cover",
-          transform: `scale(${scale})`,
-          filter:
-            scene.filter ?? "contrast(1.06) saturate(0.88) brightness(0.92)",
+          objectFit: scene.fit ?? "contain",
+          ...(scene.filter ? { filter: scene.filter } : {}),
         }}
       />
-      <AbsoluteFill
-        style={{
-          background: toneGradient(scene.tone ?? "cold"),
-          mixBlendMode: "multiply",
-        }}
-      />
-      <AbsoluteFill
-        style={{
-          background:
-            "radial-gradient(circle at center, transparent 52%, rgba(0,0,0,0.52) 100%)",
-        }}
-      />
-      <AbsoluteFill
-        style={{
-          background:
-            "linear-gradient(180deg, rgba(255,255,255,0.02) 0%, transparent 8%, transparent 92%, rgba(255,255,255,0.02) 100%)",
-          opacity: 0.6,
-        }}
-      />
+    </AbsoluteFill>
+  );
+};
+
+const GridScene: React.FC<{ scene: CinematicGridScene }> = ({ scene }) => {
+  const fps = useVideoConfig().fps;
+  const gap = scene.gapPx ?? 6;
+  const n = scene.cells.length;
+
+  return (
+    <AbsoluteFill style={{ backgroundColor: "#000000" }}>
+      <AbsoluteFill style={{ flexDirection: "row", padding: gap, gap }}>
+        {scene.cells.map((cell, i) => {
+          const trimBefore =
+            cell.trimBeforeSeconds !== undefined
+              ? Math.round(cell.trimBeforeSeconds * fps)
+              : undefined;
+          const trimAfter =
+            cell.trimAfterSeconds !== undefined
+              ? Math.round(cell.trimAfterSeconds * fps)
+              : undefined;
+          return (
+            <div
+              key={i}
+              style={{
+                position: "relative",
+                width: `${100 / n}%`,
+                height: "100%",
+                overflow: "hidden",
+                backgroundColor: "#000",
+              }}
+            >
+              <OffthreadVideo
+                muted
+                src={resolveAsset(cell.src)}
+                trimBefore={trimBefore}
+                trimAfter={trimAfter}
+                style={{
+                  width: "100%",
+                  height: "100%",
+                  objectFit: "contain",
+                  ...(cell.filter ? { filter: cell.filter } : {}),
+                }}
+              />
+            </div>
+          );
+        })}
+      </AbsoluteFill>
     </AbsoluteFill>
   );
 };
@@ -513,6 +530,8 @@ export const CinematicRenderer: React.FC<CinematicRendererProps> = ({
         >
           {scene.kind === "video" ? (
             <SceneVideo scene={scene} />
+          ) : scene.kind === "grid" ? (
+            <GridScene scene={scene} />
           ) : (
             <TitleCard
               text={scene.text}
